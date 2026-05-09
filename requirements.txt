@@ -1,0 +1,5 @@
+langchain-google-genai
+langgraph
+google-generativeai
+pydantic
+requests
