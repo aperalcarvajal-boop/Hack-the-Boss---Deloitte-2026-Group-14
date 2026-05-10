@@ -17,7 +17,9 @@ class AgentState(TypedDict):
     entidades_medicas: List[Dict[str, Any]]
     ensayos_encontrados: List[Dict[str, Any]]
     ensayos_validados: List[Dict[str, Any]]
-    ensayos_rankeados: List[Dict[str, Any]]
+    ensayos_rankeados: List[Dict[str, Any]]  # This matches your line 20
+    preguntas_pendientes: List[Dict[str, Any]] # Add this for Node 5
+    dosier_final: str                         # Add this for Node 6
 
 # 2. NODO 1: EXTRACTOR CON LLM + MeSH REAL
 def nodo_extractor(state: AgentState):
@@ -215,6 +217,89 @@ def nodo_scorer(state: AgentState):
     print(f"✅ Ranking NDCG@10: Scores {ensayos_rankeados[0]['score_final']:.3f} - {ensayos_rankeados[-1]['score_final']:.3f}")
     return {"ensayos_rankeados": ensayos_rankeados}
 
+#NODO 5
+def nodo_preguntas(state: AgentState):
+    print("\n--- EJECUTANDO NODO 5: GENERADOR DE PREGUNTAS ---")
+    
+    # We only care about the top 10 trials now
+    top_10 = state.get("ensayos_rankeados", [])
+    preguntas_por_ensayo = []
+    
+    # We'll use the same LLM instance P1 set up
+    # Note: This assumes P1 named the model 'llm'
+    from langchain_core.messages import HumanMessage
+
+    for ensayo in top_10:
+        nei_criteria = [c for c in ensayo.get("evaluacion_criterios", []) if c['resultado'] == 'NEI']
+        
+        if nei_criteria:
+            # We take the criteria that were NEI and ask Gemini to form a question
+            criterios_texto = "\n".join([f"- {c['criterio']}" for c in nei_criteria])
+            
+            prompt = f"""
+            Basado en los siguientes criterios médicos donde no tenemos información suficiente del paciente, 
+            formula UNA SOLA pregunta clínica clara y directa que el médico debería hacerle al paciente 
+            para resolver estas dudas.
+
+            CRITERIOS CON DUDA:
+            {criterios_texto}
+
+            Responde solo con la pregunta, en una sola línea.
+            """
+            
+            # Using Gemini to generate the question
+            # (Ensure P1 has initialized 'llm' globally or pass it in)
+            try:
+                response = model.generate_content(prompt)
+                pregunta = response.text.strip()
+            except:
+                pregunta = "Consulte al paciente sobre su historial relacionado con estos criterios."
+
+            preguntas_por_ensayo.append({
+                "NCTId": ensayo.get("NCTId"),
+                "pregunta": pregunta
+            })
+
+    return {"preguntas_pendientes": preguntas_por_ensayo}
+
+#NODO 6
+def nodo_dosier(state: AgentState):
+    print("\n--- EJECUTANDO NODO 6: GENERADOR DE DOSIER ---")
+    
+    top_10 = state.get("ensayos_rankeados", [])
+    preguntas = state.get("preguntas_pendientes", [])
+    
+    # Start the Markdown string
+    report = "# INFORME DE COMPATIBILIDAD DE ENSAYOS CLÍNICOS\n"
+    report += f"**Resumen del Perfil:** {state.get('perfil_paciente', '')[:100]}...\n\n"
+    report += "---\n\n"
+
+    for i, ensayo in enumerate(top_10, 1):
+        NCTId = ensayo.get("NCTId", "N/A")
+        titulo = ensayo.get("BriefTitle", "Sin título")
+        score = ensayo.get("score_final", 0)
+        
+        # Header for each trial
+        report += f"## {i}. {titulo} (Score: {score})\n"
+        report += f"**ID:** {nct_id} | **Fase:** {ensayo.get('fase')} | **Estado:** {ensayo.get('estado')}\n\n"
+        
+        # Table of criteria
+        report += "| Criterio | Resultado | Justificación |\n"
+        report += "| :--- | :--- | :--- |\n"
+        for crit in ensayo.get("evaluacion_criterios", []):
+            res = crit['resultado']
+            # Add emojis for visual clarity
+            emoji = "✅" if res == "MET" else "❌" if res == "NOT_MET" else "❓"
+            report += f"| {crit['criterio']} | {emoji} {res} | {crit['justificacion']} |\n"
+        
+        # Add the specific question from Node 5 if it exists
+        pregunta_match = next((p['pregunta'] for p in preguntas if p['NCTId'] == NCTId), None)
+        if pregunta_match:
+            report += f"\n> **🚩 Acción Requerida:** {pregunta_match}\n"
+        
+        report += "\n---\n"
+
+    return {"dosier_final": report}
 # 6. GRAFO COMPLETO
 workflow = StateGraph(AgentState)
 
@@ -222,12 +307,16 @@ workflow.add_node("extractor", nodo_extractor)
 workflow.add_node("retriever", nodo_retriever)
 workflow.add_node("validador", nodo_validador)
 workflow.add_node("scorer", nodo_scorer)
+workflow.add_node("preguntas", nodo_preguntas)  # <--- YOUR NODE
+workflow.add_node("dosier", nodo_dosier)        # <--- YOUR NODE
 
 workflow.set_entry_point("extractor")
 workflow.add_edge("extractor", "retriever")
 workflow.add_edge("retriever", "validador")
 workflow.add_edge("validador", "scorer")
-workflow.add_edge("scorer", END)
+workflow.add_edge("scorer", "preguntas")      # <--- NEW CONNECTION
+workflow.add_edge("preguntas", "dosier")       # <--- NEW CONNECTION
+workflow.add_edge("dosier", END)               # <--- FINAL STOP
 
 # 🚀 APP FINAL
 app = workflow.compile()
@@ -245,7 +334,9 @@ if __name__ == "__main__":
         "entidades_medicas": [],
         "ensayos_encontrados": [],
         "ensayos_validados": [],
-        "ensayos_rankeados": []
+        "ensayos_rankeados": [],
+        "preguntas_pendientes": [], # Add this
+        "dosier_final": ""          # Add this
     })
     
     print("\n🏆 TOP 3 RANKING NDCG@10:")
